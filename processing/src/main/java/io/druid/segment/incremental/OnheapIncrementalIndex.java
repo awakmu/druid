@@ -21,7 +21,6 @@ package io.druid.segment.incremental;
 
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
-import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.metamx.common.ISE;
 import io.druid.data.input.InputRow;
@@ -29,25 +28,61 @@ import io.druid.granularity.QueryGranularity;
 import io.druid.query.aggregation.Aggregator;
 import io.druid.query.aggregation.AggregatorFactory;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  */
 public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
 {
   private final ConcurrentNavigableMap<TimeAndDims, Integer> facts;
-  private final List<Aggregator[]> aggList = Lists.newArrayList();
+  private final List<Aggregator[]> aggList = Collections.synchronizedList(
+      new ArrayList<Aggregator[]>()
+      {
+        @Override
+        public Aggregator[] set(int pos, Aggregator[] val)
+        {
+          this.fillUpTo(pos);
+          return super.set(pos, val);
+        }
+
+        @Override
+        public Aggregator[] get(int pos)
+        {
+          fillUpTo(pos);
+          return super.get(pos);
+        }
+
+        private void fillUpTo(int pos)
+        {
+          if (pos >= size()) {
+            this.ensureCapacity(pos + 1);
+            while (pos >= size()) {
+              this.add(null);
+            }
+          }
+        }
+      }
+  );
+
   private final int maxRowCount;
 
   private String outOfRowsReason = null;
 
-  public OnheapIncrementalIndex(IncrementalIndexSchema incrementalIndexSchema, boolean deserializeComplexMetrics, int maxRowCount)
+  public OnheapIncrementalIndex(
+      IncrementalIndexSchema incrementalIndexSchema,
+      boolean deserializeComplexMetrics,
+      int maxRowCount
+  )
   {
     super(incrementalIndexSchema, deserializeComplexMetrics);
     this.facts = new ConcurrentSkipListMap<>();
@@ -127,37 +162,56 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
       ThreadLocal<InputRow> in
   ) throws IndexSizeExceededException
   {
-    Integer rowOffset;
-    synchronized (this) {
-      rowOffset = numEntries.get();
-      if(rowOffset >= maxRowCount && !facts.containsKey(key)) {
-        throw new IndexSizeExceededException("Maximum number of rows reached");
+    Integer priorIdex = facts.get(key);
+    final Boolean hadPriorValue = null != priorIdex;
+
+    Aggregator[] aggs = hadPriorValue ? aggList.get(priorIdex) : new Aggregator[metrics.length];
+
+    if (!hadPriorValue) {
+      for (int i = 0; i < metrics.length; i++) {
+        final AggregatorFactory agg = metrics[i];
+        aggs[i] = agg.factorize(
+            makeColumnSelectorFactory(agg, in, deserializeComplexMetrics)
+        );
       }
-      final Integer prev = facts.putIfAbsent(key, rowOffset);
-      if (prev != null) {
-        rowOffset = prev;
+    }
+    synchronized (aggList) {
+      // Synchronize across `aggList` and `facts`
+      final Integer innerPriorIndex = facts.get(key);
+      if (null != innerPriorIndex) {
+        aggs = aggList.get(innerPriorIndex);
       } else {
-        Aggregator[] aggs = new Aggregator[metrics.length];
-        for (int i = 0; i < metrics.length; i++) {
-          final AggregatorFactory agg = metrics[i];
-          aggs[i] = agg.factorize(
-              makeColumnSelectorFactory(agg, in, deserializeComplexMetrics)
-          );
+        final Integer rowOffset = aggList.size();
+        if (rowOffset >= maxRowCount && !facts.containsKey(key)) {
+          throw new IndexSizeExceededException("Maximum number of rows reached");
         }
         aggList.add(aggs);
-        numEntries.incrementAndGet();
+        if (aggList.size() != rowOffset + 1) {
+          throw new ISE("Corrupt row offset");
+        }
+
+        // Last ditch sanity check
+        final Integer prev = facts.putIfAbsent(key, rowOffset);
+        if (null == prev) {
+          numEntries.incrementAndGet();
+        } else {
+          // At this point we have an extra entry in aggList
+          aggs = aggList.get(prev);
+        }
       }
     }
 
     in.set(row);
 
-    final Aggregator[] aggs = aggList.get(rowOffset);
-    for (int i = 0; i < aggs.length; i++) {
-      synchronized (aggs[i]) {
-        aggs[i].aggregate();
+    for (Aggregator agg : aggs) {
+      synchronized (agg) {
+        agg.aggregate();
       }
     }
+
     in.set(null);
+
+
     return numEntries.get();
   }
 
@@ -165,7 +219,7 @@ public class OnheapIncrementalIndex extends IncrementalIndex<Aggregator>
   public boolean canAppendRow()
   {
     final boolean canAdd = size() < maxRowCount;
-    if(!canAdd) {
+    if (!canAdd) {
       outOfRowsReason = String.format("Maximum number of rows [%d] reached", maxRowCount);
     }
     return canAdd;
